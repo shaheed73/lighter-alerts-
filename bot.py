@@ -30,6 +30,9 @@ EMA_PERIOD = 200
 # Minimum wick size as a percentage of price (filters weak SFPs)
 MIN_WICK_PCT = 0.0075  # 0.75%
 
+# Deduplication: tracks already-alerted SFPs {symbol_timeframe: candle_timestamp}
+alerted_sfps: dict = {}
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -194,6 +197,14 @@ async def send_telegram(session: aiohttp.ClientSession, message: str) -> None:
         log.error(f"Telegram send failed: {e}")
 
 
+def bst_now() -> str:
+    """Return current time as BST (UTC+1) and UTC string."""
+    from datetime import timedelta
+    utc_now = datetime.now(timezone.utc)
+    bst = utc_now + timedelta(hours=1)
+    return f"{bst.strftime('%Y-%m-%d %H:%M')} BST ({utc_now.strftime('%H:%M')} UTC)"
+
+
 def format_alert(
     symbol: str,
     market_type: str,
@@ -219,7 +230,7 @@ def format_alert(
         f"📈 <b>Daily 200 EMA:</b> {ema_daily:.4f}\n"
         f"📈 <b>4H 200 EMA:</b> {ema_4h:.4f}\n"
         f"✅ <b>Bias:</b> Price {bias} both EMAs → {direction} bias confirmed\n"
-        f"🕒 <b>Scan time:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+        f"🕒 <b>Scan time:</b> {bst_now()}"
     )
 
 
@@ -276,9 +287,15 @@ async def scan_market(
     if daily_sfp:
         sfp_is_long = daily_sfp["direction"] == "long"
         if sfp_is_long == price_above_ema:
-            msg = format_alert(symbol, market_type, "Daily", daily_sfp, ema_200_daily, ema_200_4h, current_price)
-            alerts.append(msg)
-            log.info(f"ALERT: {symbol} Daily SFP {daily_sfp['direction'].upper()}")
+            dedup_key = f"{symbol}_Daily"
+            candle_ts = daily_candles[-2]["t"]
+            if alerted_sfps.get(dedup_key) != candle_ts:
+                alerted_sfps[dedup_key] = candle_ts
+                msg = format_alert(symbol, market_type, "Daily", daily_sfp, ema_200_daily, ema_200_4h, current_price)
+                alerts.append(msg)
+                log.info(f"ALERT: {symbol} Daily SFP {daily_sfp['direction'].upper()}")
+            else:
+                log.debug(f"{symbol} Daily SFP already alerted for this candle, skipping")
 
     # ── 4H SFP scan ─────────────────────────────────────────────────────
     h4_candles = await fetch_candles(session, market_id, "4h", 50)
@@ -287,9 +304,15 @@ async def scan_market(
         if h4_sfp:
             sfp_is_long = h4_sfp["direction"] == "long"
             if sfp_is_long == price_above_ema:
-                msg = format_alert(symbol, market_type, "4H", h4_sfp, ema_200_daily, ema_200_4h, current_price)
-                alerts.append(msg)
-                log.info(f"ALERT: {symbol} 4H SFP {h4_sfp['direction'].upper()}")
+                dedup_key = f"{symbol}_4H"
+                candle_ts = h4_candles[-2]["t"]
+                if alerted_sfps.get(dedup_key) != candle_ts:
+                    alerted_sfps[dedup_key] = candle_ts
+                    msg = format_alert(symbol, market_type, "4H", h4_sfp, ema_200_daily, ema_200_4h, current_price)
+                    alerts.append(msg)
+                    log.info(f"ALERT: {symbol} 4H SFP {h4_sfp['direction'].upper()}")
+                else:
+                    log.debug(f"{symbol} 4H SFP already alerted for this candle, skipping")
 
     return alerts
 
