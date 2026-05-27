@@ -27,6 +27,9 @@ SFP_LOOKBACK = 20
 # 200 EMA period
 EMA_PERIOD = 200
 
+# Minimum wick size as a percentage of price (filters weak SFPs)
+MIN_WICK_PCT = 0.0075  # 0.75%
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -146,20 +149,28 @@ def detect_sfp(candles: list[dict]) -> dict | None:
 
     # Bullish SFP: wick below prior swing low, close back above it
     if c_low < prior_swing_low and c_close > prior_swing_low:
+        wick_size = (prior_swing_low - c_low) / prior_swing_low
+        if wick_size < MIN_WICK_PCT:
+            return None
         return {
             "direction": "long",
             "swing_level": prior_swing_low,
             "wick_extreme": c_low,
             "close": c_close,
+            "wick_pct": wick_size,
         }
 
     # Bearish SFP: wick above prior swing high, close back below it
     if c_high > prior_swing_high and c_close < prior_swing_high:
+        wick_size = (c_high - prior_swing_high) / prior_swing_high
+        if wick_size < MIN_WICK_PCT:
+            return None
         return {
             "direction": "short",
             "swing_level": prior_swing_high,
             "wick_extreme": c_high,
             "close": c_close,
+            "wick_pct": wick_size,
         }
 
     return None
@@ -188,12 +199,14 @@ def format_alert(
     market_type: str,
     timeframe: str,
     sfp: dict,
-    ema_value: float,
+    ema_daily: float,
+    ema_4h: float,
     current_price: float,
 ) -> str:
     direction = sfp["direction"].upper()
     emoji = "🟢" if sfp["direction"] == "long" else "🔴"
     bias = "ABOVE" if sfp["direction"] == "long" else "BELOW"
+    wick_pct = sfp.get("wick_pct", 0) * 100
 
     return (
         f"{emoji} <b>SFP SETUP — {symbol} ({market_type.upper()})</b>\n"
@@ -202,9 +215,10 @@ def format_alert(
         f"📍 <b>Direction:</b> {direction}\n"
         f"💰 <b>Current Price:</b> {current_price:.4f}\n"
         f"📏 <b>Swing Level:</b> {sfp['swing_level']:.4f}\n"
-        f"🔽 <b>Wick Extreme:</b> {sfp['wick_extreme']:.4f}\n"
-        f"📈 <b>Daily 200 EMA:</b> {ema_value:.4f}\n"
-        f"✅ <b>Bias:</b> Price {bias} 200 EMA → {direction} bias confirmed\n"
+        f"🔽 <b>Wick Extreme:</b> {sfp['wick_extreme']:.4f} ({wick_pct:.2f}% breach)\n"
+        f"📈 <b>Daily 200 EMA:</b> {ema_daily:.4f}\n"
+        f"📈 <b>4H 200 EMA:</b> {ema_4h:.4f}\n"
+        f"✅ <b>Bias:</b> Price {bias} both EMAs → {direction} bias confirmed\n"
         f"🕒 <b>Scan time:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
     )
 
@@ -230,20 +244,39 @@ async def scan_market(
         return []
 
     closes = [c["c"] for c in daily_candles]
-    ema_200 = calculate_ema(closes, EMA_PERIOD)
-    if ema_200 is None:
+    ema_200_daily = calculate_ema(closes, EMA_PERIOD)
+    if ema_200_daily is None:
         return []
 
     current_price = daily_candles[-1]["c"]
-    price_above_ema = current_price > ema_200
+    price_above_daily_ema = current_price > ema_200_daily
+
+    # Fetch 4H candles for 4H 200 EMA confirmation (need 210 candles)
+    h4_ema_candles = await fetch_candles(session, market_id, "4h", 210)
+    if len(h4_ema_candles) < EMA_PERIOD + 5:
+        log.debug(f"{symbol}: insufficient 4H candles for EMA ({len(h4_ema_candles)}), skipping")
+        return []
+
+    h4_closes = [c["c"] for c in h4_ema_candles]
+    ema_200_4h = calculate_ema(h4_closes, EMA_PERIOD)
+    if ema_200_4h is None:
+        return []
+
+    price_above_4h_ema = current_price > ema_200_4h
+
+    # Both EMAs must agree on direction
+    if price_above_daily_ema != price_above_4h_ema:
+        log.debug(f"{symbol}: Daily and 4H EMA bias conflict, skipping")
+        return []
+
+    price_above_ema = price_above_daily_ema
 
     # ── Daily SFP scan ──────────────────────────────────────────────────
     daily_sfp = detect_sfp(daily_candles)
     if daily_sfp:
         sfp_is_long = daily_sfp["direction"] == "long"
-        # SFP direction must match EMA bias
         if sfp_is_long == price_above_ema:
-            msg = format_alert(symbol, market_type, "Daily", daily_sfp, ema_200, current_price)
+            msg = format_alert(symbol, market_type, "Daily", daily_sfp, ema_200_daily, ema_200_4h, current_price)
             alerts.append(msg)
             log.info(f"ALERT: {symbol} Daily SFP {daily_sfp['direction'].upper()}")
 
@@ -254,7 +287,7 @@ async def scan_market(
         if h4_sfp:
             sfp_is_long = h4_sfp["direction"] == "long"
             if sfp_is_long == price_above_ema:
-                msg = format_alert(symbol, market_type, "4H", h4_sfp, ema_200, current_price)
+                msg = format_alert(symbol, market_type, "4H", h4_sfp, ema_200_daily, ema_200_4h, current_price)
                 alerts.append(msg)
                 log.info(f"ALERT: {symbol} 4H SFP {h4_sfp['direction'].upper()}")
 
