@@ -19,10 +19,13 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 
 BASE_URL = "https://mainnet.zklighter.elliot.ai"
-SCAN_INTERVAL_HOURS = 2
+SCAN_INTERVAL_MINUTES = 30
 
 # SFP detection: how many candles to look back for the prior swing high/low
 SFP_LOOKBACK = 20
+
+# How many candles to scan for target resistance/support levels
+TARGET_LOOKBACK = 100
 
 # 200 EMA period
 EMA_PERIOD = 200
@@ -32,6 +35,9 @@ MIN_WICK_PCT = 0.0075  # 0.75%
 
 # Minimum R:R ratio required to send alert
 MIN_RR = 2.0
+
+# Maximum % price can be beyond entry zone before alert is suppressed
+MAX_ENTRY_DRIFT_PCT = 0.015  # 1.5%
 
 # Deduplication: tracks already-alerted SFPs {symbol_timeframe: candle_timestamp}
 alerted_sfps: dict = {}
@@ -124,35 +130,50 @@ def calculate_ema(prices: list[float], period: int) -> float | None:
 
 def find_nearest_target(candles: list[dict], direction: str, entry: float, stop: float) -> float | None:
     """
-    Find the nearest swing high (for longs) or swing low (for shorts)
-    in the lookback window that gives at least MIN_RR.
-    Returns the target price or None if no valid target exists.
+    Find the nearest genuine resistance (for longs) or support (for shorts)
+    by scanning TARGET_LOOKBACK candles for swing highs/lows that price has
+    respected — i.e. levels where price previously stalled or reversed.
+    Only returns levels that give at least MIN_RR.
     """
     risk = abs(entry - stop)
     if risk == 0:
         return None
 
     min_target_distance = risk * MIN_RR
-    lookback_candles = candles[-(SFP_LOOKBACK + 2):-2]
+
+    # Use all available candles except the last two (current + forming)
+    scan_candles = candles[-(TARGET_LOOKBACK + 2):-2]
+    if not scan_candles:
+        return None
 
     if direction == "long":
-        # Find swing highs above entry that give at least 2:1
-        candidates = [
-            c["h"] for c in lookback_candles
-            if c["h"] > entry + min_target_distance
-        ]
+        # Find swing highs above entry that give at least MIN_RR
+        # A swing high is a candle whose high is higher than both neighbours
+        candidates = []
+        for i in range(1, len(scan_candles) - 1):
+            c = scan_candles[i]
+            prev_h = scan_candles[i - 1]["h"]
+            next_h = scan_candles[i + 1]["h"]
+            if c["h"] > prev_h and c["h"] > next_h:
+                if c["h"] >= entry + min_target_distance:
+                    candidates.append(c["h"])
         if not candidates:
             return None
-        return min(candidates)  # nearest (lowest) qualifying high
+        return min(candidates)  # nearest qualifying swing high
+
     else:
-        # Find swing lows below entry that give at least 2:1
-        candidates = [
-            c["l"] for c in lookback_candles
-            if c["l"] < entry - min_target_distance
-        ]
+        # Find swing lows below entry that give at least MIN_RR
+        candidates = []
+        for i in range(1, len(scan_candles) - 1):
+            c = scan_candles[i]
+            prev_l = scan_candles[i - 1]["l"]
+            next_l = scan_candles[i + 1]["l"]
+            if c["l"] < prev_l and c["l"] < next_l:
+                if c["l"] <= entry - min_target_distance:
+                    candidates.append(c["l"])
         if not candidates:
             return None
-        return max(candidates)  # nearest (highest) qualifying low
+        return max(candidates)  # nearest qualifying swing low
 
 
 def detect_sfp(candles: list[dict]) -> dict | None:
@@ -352,24 +373,28 @@ async def scan_market(
                 dedup_key = f"{symbol}_Daily"
                 candle_ts = daily_candles[-2]["t"]
                 if alerted_sfps.get(dedup_key) != candle_ts:
-                    # R:R check
+                    # Entry proximity check — suppress if price moved too far
                     entry = daily_sfp["swing_level"]
                     stop = daily_sfp["wick_extreme"]
-                    risk = abs(entry - stop)
-                    target = find_nearest_target(daily_candles, daily_sfp["direction"], entry, stop)
-                    if target is None:
-                        log.debug(f"{symbol} Daily SFP no valid 2:1 target found, skipping")
+                    drift = abs(current_price - entry) / entry
+                    if drift > MAX_ENTRY_DRIFT_PCT:
+                        log.debug(f"{symbol} Daily SFP entry drift {drift*100:.1f}% > {MAX_ENTRY_DRIFT_PCT*100}%, suppressing")
                     else:
-                        rr = abs(target - entry) / risk
-                        alerted_sfps[dedup_key] = candle_ts
-                        msg = format_alert(symbol, market_type, "Daily", daily_sfp, ema_200_daily, ema_200_4h, current_price, target, rr)
-                        alerts.append(msg)
-                        log.info(f"ALERT: {symbol} Daily SFP {daily_sfp['direction'].upper()} R:R={rr:.1f}")
+                        risk = abs(entry - stop)
+                        target = find_nearest_target(daily_candles, daily_sfp["direction"], entry, stop)
+                        if target is None:
+                            log.debug(f"{symbol} Daily SFP no valid 2:1 target found, skipping")
+                        else:
+                            rr = abs(target - entry) / risk
+                            alerted_sfps[dedup_key] = candle_ts
+                            msg = format_alert(symbol, market_type, "Daily", daily_sfp, ema_200_daily, ema_200_4h, current_price, target, rr)
+                            alerts.append(msg)
+                            log.info(f"ALERT: {symbol} Daily SFP {daily_sfp['direction'].upper()} R:R={rr:.1f}")
                 else:
                     log.debug(f"{symbol} Daily SFP already alerted for this candle, skipping")
 
     # ── 4H SFP scan ─────────────────────────────────────────────────────
-    h4_candles = await fetch_candles(session, market_id, "4h", 50)
+    h4_candles = await fetch_candles(session, market_id, "4h", TARGET_LOOKBACK + 10)
     if len(h4_candles) >= SFP_LOOKBACK + 2:
         h4_sfp = detect_sfp(h4_candles)
         if h4_sfp:
@@ -385,19 +410,23 @@ async def scan_market(
                     dedup_key = f"{symbol}_4H"
                     candle_ts = h4_candles[-2]["t"]
                     if alerted_sfps.get(dedup_key) != candle_ts:
-                        # R:R check
+                        # Entry proximity check — suppress if price moved too far
                         entry = h4_sfp["swing_level"]
                         stop = h4_sfp["wick_extreme"]
-                        risk = abs(entry - stop)
-                        target = find_nearest_target(h4_candles, h4_sfp["direction"], entry, stop)
-                        if target is None:
-                            log.debug(f"{symbol} 4H SFP no valid 2:1 target found, skipping")
+                        drift = abs(current_price - entry) / entry
+                        if drift > MAX_ENTRY_DRIFT_PCT:
+                            log.debug(f"{symbol} 4H SFP entry drift {drift*100:.1f}% > {MAX_ENTRY_DRIFT_PCT*100}%, suppressing")
                         else:
-                            rr = abs(target - entry) / risk
-                            alerted_sfps[dedup_key] = candle_ts
-                            msg = format_alert(symbol, market_type, "4H", h4_sfp, ema_200_daily, ema_200_4h, current_price, target, rr)
-                            alerts.append(msg)
-                            log.info(f"ALERT: {symbol} 4H SFP {h4_sfp['direction'].upper()} R:R={rr:.1f}")
+                            risk = abs(entry - stop)
+                            target = find_nearest_target(h4_candles, h4_sfp["direction"], entry, stop)
+                            if target is None:
+                                log.debug(f"{symbol} 4H SFP no valid 2:1 target found, skipping")
+                            else:
+                                rr = abs(target - entry) / risk
+                                alerted_sfps[dedup_key] = candle_ts
+                                msg = format_alert(symbol, market_type, "4H", h4_sfp, ema_200_daily, ema_200_4h, current_price, target, rr)
+                                alerts.append(msg)
+                                log.info(f"ALERT: {symbol} 4H SFP {h4_sfp['direction'].upper()} R:R={rr:.1f}")
                     else:
                         log.debug(f"{symbol} 4H SFP already alerted for this candle, skipping")
 
@@ -459,7 +488,7 @@ async def main() -> None:
         await send_telegram(
             session,
             f"🤖 <b>Lighter Alert Bot Online</b>\n"
-            f"Scanning all active markets every {SCAN_INTERVAL_HOURS}h\n"
+            f"Scanning all active markets every {SCAN_INTERVAL_MINUTES}min\n"
             f"Filters: Daily & 4H 200 EMA bias + SFP (4H & Daily)\n"
             f"Started at {bst_now()}"
         )
@@ -471,8 +500,8 @@ async def main() -> None:
                 log.error(f"Scan loop error: {e}")
                 await send_telegram(session, f"⚠️ Bot error: {e}")
 
-            log.info(f"Next scan in {SCAN_INTERVAL_HOURS} hours")
-            await asyncio.sleep(SCAN_INTERVAL_HOURS * 3600)
+            log.info(f"Next scan in {SCAN_INTERVAL_MINUTES} minutes")
+            await asyncio.sleep(SCAN_INTERVAL_MINUTES * 60)
 
 
 if __name__ == "__main__":
