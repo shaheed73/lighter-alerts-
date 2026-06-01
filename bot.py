@@ -37,7 +37,7 @@ MIN_WICK_PCT = 0.0075  # 0.75%
 MIN_RR = 2.0
 
 # Maximum % price can be beyond entry zone before alert is suppressed
-MAX_ENTRY_DRIFT_PCT = 0.015  # 1.5%
+MAX_ENTRY_DRIFT_PCT = 0.02  # 2.0%
 
 # Deduplication: tracks already-alerted SFPs {symbol_timeframe: candle_timestamp}
 alerted_sfps: dict = {}
