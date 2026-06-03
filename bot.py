@@ -316,7 +316,7 @@ async def scan_market(
 
     # Fetch daily candles for 200 EMA
     daily_candles = await fetch_candles(session, symbol, "1d", 210)
-    if len(daily_candles) < EMA_PERIOD + 5:
+    if len(daily_candles) < 100:
         log.debug(f"{symbol}: insufficient daily candles ({len(daily_candles)}), skipping")
         return []
 
@@ -330,7 +330,7 @@ async def scan_market(
 
     # Fetch 4H candles for 4H 200 EMA
     h4_ema_candles = await fetch_candles(session, symbol, "4h", 210)
-    if len(h4_ema_candles) < EMA_PERIOD + 5:
+    if len(h4_ema_candles) < 100:
         log.debug(f"{symbol}: insufficient 4H candles for EMA ({len(h4_ema_candles)}), skipping")
         return []
 
