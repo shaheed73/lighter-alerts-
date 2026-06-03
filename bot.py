@@ -1,8 +1,8 @@
 """
-Lighter Exchange Alert Bot
-Scans all active markets every 2 hours for:
-  - SFP (Swing Failure Pattern) on 4h and Daily timeframes
-  - Filtered by 200 EMA bias on Daily timeframe
+Hyperliquid Alert Bot
+Scans all active perpetual markets every 30 minutes for:
+  - SFP (Swing Failure Pattern) on 4H and Daily timeframes
+  - Filtered by 200 EMA bias on both Daily and 4H timeframes
 Sends alerts to Telegram when setups align.
 """
 
@@ -18,7 +18,7 @@ import aiohttp
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 
-BASE_URL = "https://mainnet.zklighter.elliot.ai"
+BASE_URL = "https://api.hyperliquid.xyz/info"
 SCAN_INTERVAL_MINUTES = 30
 
 # SFP detection: how many candles to look back for the prior swing high/low
@@ -50,23 +50,28 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ─── LIGHTER API ──────────────────────────────────────────────────────────────
+# ─── HYPERLIQUID API ──────────────────────────────────────────────────────────
 
 async def fetch_active_markets(session: aiohttp.ClientSession) -> list[dict]:
-    """Fetch all active markets from Lighter and return list of {symbol, market_id}."""
-    url = f"{BASE_URL}/api/v1/orderBooks"
+    """Fetch all active perpetual markets from Hyperliquid."""
     try:
-        async with session.get(url, params={"filter": "all"}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        async with session.post(
+            BASE_URL,
+            json={"type": "meta"},
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
             data = await resp.json()
             markets = []
-            for ob in data.get("order_books", []):
-                if ob.get("status") == "active":
-                    markets.append({
-                        "symbol": ob["symbol"],
-                        "market_id": ob["market_id"],
-                        "market_type": ob.get("market_type", "perp"),
-                    })
-            log.info(f"Found {len(markets)} active markets on Lighter")
+            for asset in data.get("universe", []):
+                name = asset.get("name", "")
+                # Skip builder-deployed (HIP-3) markets — format is "ISSUER:ASSET"
+                if ":" in name:
+                    continue
+                markets.append({
+                    "symbol": name,
+                    "market_type": "perp",
+                })
+            log.info(f"Found {len(markets)} active markets on Hyperliquid")
             return markets
     except Exception as e:
         log.error(f"Failed to fetch markets: {e}")
@@ -75,43 +80,56 @@ async def fetch_active_markets(session: aiohttp.ClientSession) -> list[dict]:
 
 async def fetch_candles(
     session: aiohttp.ClientSession,
-    market_id: int,
+    symbol: str,
     resolution: str,
     count: int,
 ) -> list[dict]:
     """
     Fetch `count` candles for a market at a given resolution.
-    Resolution options: 1m, 5m, 15m, 30m, 1h, 4h, 12h, 1d, 1w
+    Resolution options: 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 8h, 12h, 1d, 3d, 1w
     Returns list of candle dicts with keys: t, o, h, l, c
     """
-    url = f"{BASE_URL}/api/v1/candles"
     now_ms = int(time.time() * 1000)
 
-    # Resolution to milliseconds map for start_timestamp calculation
     res_ms = {
-        "1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
-        "1h": 3_600_000, "4h": 14_400_000, "12h": 43_200_000,
-        "1d": 86_400_000, "1w": 604_800_000,
+        "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
+        "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000,
+        "4h": 14_400_000, "8h": 28_800_000, "12h": 43_200_000,
+        "1d": 86_400_000, "3d": 259_200_000, "1w": 604_800_000,
     }
     ms_per_candle = res_ms.get(resolution, 86_400_000)
-    start_ms = now_ms - (count + 5) * ms_per_candle  # small buffer
+    start_ms = now_ms - (count + 5) * ms_per_candle
 
-    params = {
-        "market_id": market_id,
-        "resolution": resolution,
-        "start_timestamp": start_ms,
-        "end_timestamp": now_ms,
-        "count_back": count,
+    payload = {
+        "type": "candleSnapshot",
+        "req": {
+            "coin": symbol,
+            "interval": resolution,
+            "startTime": start_ms,
+            "endTime": now_ms,
+        }
     }
     try:
-        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        async with session.post(
+            BASE_URL,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
             data = await resp.json()
-            candles = data.get("c", [])
-            # Sort ascending by timestamp
+            candles = []
+            for c in data:
+                candles.append({
+                    "t": c["t"],
+                    "o": float(c["o"]),
+                    "h": float(c["h"]),
+                    "l": float(c["l"]),
+                    "c": float(c["c"]),
+                })
             candles.sort(key=lambda x: x["t"])
-            return candles
+            # Return only the most recent `count` candles
+            return candles[-count:] if len(candles) > count else candles
     except Exception as e:
-        log.debug(f"Candle fetch error market={market_id} res={resolution}: {e}")
+        log.debug(f"Candle fetch error symbol={symbol} res={resolution}: {e}")
         return []
 
 
@@ -122,7 +140,7 @@ def calculate_ema(prices: list[float], period: int) -> float | None:
     if len(prices) < period:
         return None
     k = 2.0 / (period + 1)
-    ema = sum(prices[:period]) / period  # seed with SMA
+    ema = sum(prices[:period]) / period
     for price in prices[period:]:
         ema = price * k + ema * (1 - k)
     return ema
@@ -131,8 +149,7 @@ def calculate_ema(prices: list[float], period: int) -> float | None:
 def find_nearest_target(candles: list[dict], direction: str, entry: float, stop: float) -> float | None:
     """
     Find the nearest genuine resistance (for longs) or support (for shorts)
-    by scanning TARGET_LOOKBACK candles for swing highs/lows that price has
-    respected — i.e. levels where price previously stalled or reversed.
+    by scanning TARGET_LOOKBACK candles for swing highs/lows.
     Only returns levels that give at least MIN_RR.
     """
     risk = abs(entry - stop)
@@ -140,59 +157,38 @@ def find_nearest_target(candles: list[dict], direction: str, entry: float, stop:
         return None
 
     min_target_distance = risk * MIN_RR
-
-    # Use all available candles except the last two (current + forming)
     scan_candles = candles[-(TARGET_LOOKBACK + 2):-2]
     if not scan_candles:
         return None
 
     if direction == "long":
-        # Find swing highs above entry that give at least MIN_RR
-        # A swing high is a candle whose high is higher than both neighbours
         candidates = []
         for i in range(1, len(scan_candles) - 1):
             c = scan_candles[i]
-            prev_h = scan_candles[i - 1]["h"]
-            next_h = scan_candles[i + 1]["h"]
-            if c["h"] > prev_h and c["h"] > next_h:
+            if c["h"] > scan_candles[i - 1]["h"] and c["h"] > scan_candles[i + 1]["h"]:
                 if c["h"] >= entry + min_target_distance:
                     candidates.append(c["h"])
-        if not candidates:
-            return None
-        return min(candidates)  # nearest qualifying swing high
+        return min(candidates) if candidates else None
 
     else:
-        # Find swing lows below entry that give at least MIN_RR
         candidates = []
         for i in range(1, len(scan_candles) - 1):
             c = scan_candles[i]
-            prev_l = scan_candles[i - 1]["l"]
-            next_l = scan_candles[i + 1]["l"]
-            if c["l"] < prev_l and c["l"] < next_l:
+            if c["l"] < scan_candles[i - 1]["l"] and c["l"] < scan_candles[i + 1]["l"]:
                 if c["l"] <= entry - min_target_distance:
                     candidates.append(c["l"])
-        if not candidates:
-            return None
-        return max(candidates)  # nearest qualifying swing low
+        return max(candidates) if candidates else None
 
 
 def detect_sfp(candles: list[dict]) -> dict | None:
     """
     Detect a Swing Failure Pattern on the most recent completed candle.
-
-    Bullish SFP: price wicks BELOW the prior swing low (within lookback),
-                 but CLOSES BACK ABOVE it. Signals long.
-
-    Bearish SFP: price wicks ABOVE the prior swing high (within lookback),
-                 but CLOSES BACK BELOW it. Signals short.
-
-    Returns dict with keys: direction ('long'/'short'), swing_level, wick_extreme
-    or None if no SFP detected.
+    Bullish SFP: wicks below prior swing low, closes back above.
+    Bearish SFP: wicks above prior swing high, closes back below.
     """
     if len(candles) < SFP_LOOKBACK + 1:
         return None
 
-    # Use the last completed candle (index -2; -1 may be forming)
     current = candles[-2]
     lookback_candles = candles[-(SFP_LOOKBACK + 2):-2]
 
@@ -205,12 +201,10 @@ def detect_sfp(candles: list[dict]) -> dict | None:
     c_low = current["l"]
     c_high = current["h"]
     c_close = current["c"]
-    c_open = current["o"]
 
-    # Minimum close distance back inside as % of swing level
-    MIN_CLOSE_PCT = 0.005  # 0.5%
+    MIN_CLOSE_PCT = 0.005  # 0.5% minimum close back inside
 
-    # Bullish SFP: wick below prior swing low, close back above it
+    # Bullish SFP
     if c_low < prior_swing_low and c_close > prior_swing_low:
         wick_size = (prior_swing_low - c_low) / prior_swing_low
         if wick_size < MIN_WICK_PCT:
@@ -226,7 +220,7 @@ def detect_sfp(candles: list[dict]) -> dict | None:
             "wick_pct": wick_size,
         }
 
-    # Bearish SFP: wick above prior swing high, close back below it
+    # Bearish SFP
     if c_high > prior_swing_high and c_close < prior_swing_high:
         wick_size = (c_high - prior_swing_high) / prior_swing_high
         if wick_size < MIN_WICK_PCT:
@@ -295,8 +289,8 @@ def format_alert(
         f"📊 <b>Timeframe:</b> {timeframe}\n"
         f"📍 <b>Direction:</b> {direction}\n"
         f"💰 <b>Current Price:</b> {current_price:.4f}\n"
-        f"📏 <b>Swing Level:</b> {sfp['swing_level']:.4f}\n"
-        f"🔽 <b>Wick Extreme:</b> {sfp['wick_extreme']:.4f} ({wick_pct:.2f}% breach)\n"
+        f"📏 <b>Swing Level:</b> {entry:.4f}\n"
+        f"🔽 <b>Wick Extreme:</b> {stop:.4f} ({wick_pct:.2f}% breach)\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🎯 <b>Entry Zone:</b> {entry:.4f}\n"
         f"🛑 <b>Stop:</b> {stop:.4f}\n"
@@ -316,16 +310,12 @@ async def scan_market(
     session: aiohttp.ClientSession,
     market: dict,
 ) -> list[str]:
-    """
-    Scan a single market. Returns list of alert messages (empty if no setups).
-    """
     symbol = market["symbol"]
-    market_id = market["market_id"]
     market_type = market["market_type"]
     alerts = []
 
-    # Fetch daily candles for 200 EMA (need at least 205 for reliable EMA)
-    daily_candles = await fetch_candles(session, market_id, "1d", 210)
+    # Fetch daily candles for 200 EMA
+    daily_candles = await fetch_candles(session, symbol, "1d", 210)
     if len(daily_candles) < EMA_PERIOD + 5:
         log.debug(f"{symbol}: insufficient daily candles ({len(daily_candles)}), skipping")
         return []
@@ -338,8 +328,8 @@ async def scan_market(
     current_price = daily_candles[-1]["c"]
     price_above_daily_ema = current_price > ema_200_daily
 
-    # Fetch 4H candles for 4H 200 EMA confirmation (need 210 candles)
-    h4_ema_candles = await fetch_candles(session, market_id, "4h", 210)
+    # Fetch 4H candles for 4H 200 EMA
+    h4_ema_candles = await fetch_candles(session, symbol, "4h", 210)
     if len(h4_ema_candles) < EMA_PERIOD + 5:
         log.debug(f"{symbol}: insufficient 4H candles for EMA ({len(h4_ema_candles)}), skipping")
         return []
@@ -351,7 +341,7 @@ async def scan_market(
 
     price_above_4h_ema = current_price > ema_200_4h
 
-    # Both EMAs must agree on direction
+    # Both EMAs must agree
     if price_above_daily_ema != price_above_4h_ema:
         log.debug(f"{symbol}: Daily and 4H EMA bias conflict, skipping")
         return []
@@ -363,27 +353,25 @@ async def scan_market(
     if daily_sfp:
         sfp_is_long = daily_sfp["direction"] == "long"
         if sfp_is_long == price_above_ema:
-            # Check price is still on the correct side of swing level
             swing = daily_sfp["swing_level"]
             if sfp_is_long and current_price < swing:
-                log.debug(f"{symbol} Daily bullish SFP stale — price back below swing level")
+                log.debug(f"{symbol} Daily bullish SFP stale")
             elif not sfp_is_long and current_price > swing:
-                log.debug(f"{symbol} Daily bearish SFP stale — price back above swing level")
+                log.debug(f"{symbol} Daily bearish SFP stale")
             else:
                 dedup_key = f"{symbol}_Daily"
                 candle_ts = daily_candles[-2]["t"]
                 if alerted_sfps.get(dedup_key) != candle_ts:
-                    # Entry proximity check — suppress if price moved too far
                     entry = daily_sfp["swing_level"]
                     stop = daily_sfp["wick_extreme"]
                     drift = abs(current_price - entry) / entry
                     if drift > MAX_ENTRY_DRIFT_PCT:
-                        log.debug(f"{symbol} Daily SFP entry drift {drift*100:.1f}% > {MAX_ENTRY_DRIFT_PCT*100}%, suppressing")
+                        log.debug(f"{symbol} Daily SFP drift {drift*100:.1f}% too large, suppressing")
                     else:
                         risk = abs(entry - stop)
                         target = find_nearest_target(daily_candles, daily_sfp["direction"], entry, stop)
                         if target is None:
-                            log.debug(f"{symbol} Daily SFP no valid 2:1 target found, skipping")
+                            log.debug(f"{symbol} Daily SFP no valid 2:1 target, skipping")
                         else:
                             rr = abs(target - entry) / risk
                             alerted_sfps[dedup_key] = candle_ts
@@ -391,36 +379,34 @@ async def scan_market(
                             alerts.append(msg)
                             log.info(f"ALERT: {symbol} Daily SFP {daily_sfp['direction'].upper()} R:R={rr:.1f}")
                 else:
-                    log.debug(f"{symbol} Daily SFP already alerted for this candle, skipping")
+                    log.debug(f"{symbol} Daily SFP already alerted, skipping")
 
     # ── 4H SFP scan ─────────────────────────────────────────────────────
-    h4_candles = await fetch_candles(session, market_id, "4h", TARGET_LOOKBACK + 10)
+    h4_candles = await fetch_candles(session, symbol, "4h", TARGET_LOOKBACK + 10)
     if len(h4_candles) >= SFP_LOOKBACK + 2:
         h4_sfp = detect_sfp(h4_candles)
         if h4_sfp:
             sfp_is_long = h4_sfp["direction"] == "long"
             if sfp_is_long == price_above_ema:
-                # Check price is still on the correct side of swing level
                 swing = h4_sfp["swing_level"]
                 if sfp_is_long and current_price < swing:
-                    log.debug(f"{symbol} 4H bullish SFP stale — price back below swing level")
+                    log.debug(f"{symbol} 4H bullish SFP stale")
                 elif not sfp_is_long and current_price > swing:
-                    log.debug(f"{symbol} 4H bearish SFP stale — price back above swing level")
+                    log.debug(f"{symbol} 4H bearish SFP stale")
                 else:
                     dedup_key = f"{symbol}_4H"
                     candle_ts = h4_candles[-2]["t"]
                     if alerted_sfps.get(dedup_key) != candle_ts:
-                        # Entry proximity check — suppress if price moved too far
                         entry = h4_sfp["swing_level"]
                         stop = h4_sfp["wick_extreme"]
                         drift = abs(current_price - entry) / entry
                         if drift > MAX_ENTRY_DRIFT_PCT:
-                            log.debug(f"{symbol} 4H SFP entry drift {drift*100:.1f}% > {MAX_ENTRY_DRIFT_PCT*100}%, suppressing")
+                            log.debug(f"{symbol} 4H SFP drift {drift*100:.1f}% too large, suppressing")
                         else:
                             risk = abs(entry - stop)
                             target = find_nearest_target(h4_candles, h4_sfp["direction"], entry, stop)
                             if target is None:
-                                log.debug(f"{symbol} 4H SFP no valid 2:1 target found, skipping")
+                                log.debug(f"{symbol} 4H SFP no valid 2:1 target, skipping")
                             else:
                                 rr = abs(target - entry) / risk
                                 alerted_sfps[dedup_key] = candle_ts
@@ -428,13 +414,12 @@ async def scan_market(
                                 alerts.append(msg)
                                 log.info(f"ALERT: {symbol} 4H SFP {h4_sfp['direction'].upper()} R:R={rr:.1f}")
                     else:
-                        log.debug(f"{symbol} 4H SFP already alerted for this candle, skipping")
+                        log.debug(f"{symbol} 4H SFP already alerted, skipping")
 
     return alerts
 
 
 async def run_scan(session: aiohttp.ClientSession) -> None:
-    """Run a full scan across all active markets."""
     log.info("━━━ Starting market scan ━━━")
     markets = await fetch_active_markets(session)
     if not markets:
@@ -443,19 +428,17 @@ async def run_scan(session: aiohttp.ClientSession) -> None:
 
     all_alerts = []
 
-    # Scan markets with small delay between each to be API-friendly
     for market in markets:
         try:
             alerts = await scan_market(session, market)
             all_alerts.extend(alerts)
         except Exception as e:
             log.error(f"Error scanning {market['symbol']}: {e}")
-        await asyncio.sleep(0.3)  # gentle rate limiting
+        await asyncio.sleep(0.2)
 
     if all_alerts:
-        # Send a header first
         header = (
-            f"🔔 <b>Lighter Scan — {len(all_alerts)} Setup(s) Found</b>\n"
+            f"🔔 <b>Hyperliquid Scan — {len(all_alerts)} Setup(s) Found</b>\n"
             f"Scanned {len(markets)} markets at {bst_now()}"
         )
         await send_telegram(session, header)
@@ -465,9 +448,8 @@ async def run_scan(session: aiohttp.ClientSession) -> None:
             await asyncio.sleep(0.5)
     else:
         log.info(f"Scan complete — no setups found across {len(markets)} markets")
-        # Send a quiet heartbeat every scan so you know it's alive
         heartbeat = (
-            f"💤 <b>Lighter Scan Complete</b> — No setups\n"
+            f"💤 <b>Hyperliquid Scan Complete</b> — No setups\n"
             f"Scanned {len(markets)} markets at {bst_now()}"
         )
         await send_telegram(session, heartbeat)
@@ -476,18 +458,16 @@ async def run_scan(session: aiohttp.ClientSession) -> None:
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    log.info("Lighter Alert Bot starting...")
+    log.info("Hyperliquid Alert Bot starting...")
 
-    # Validate config
     if TELEGRAM_TOKEN == "YOUR_BOT_TOKEN_HERE" or TELEGRAM_CHAT_ID == "YOUR_CHAT_ID_HERE":
         log.error("Set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID environment variables before running.")
         return
 
     async with aiohttp.ClientSession() as session:
-        # Send startup message
         await send_telegram(
             session,
-            f"🤖 <b>Lighter Alert Bot Online</b>\n"
+            f"🤖 <b>Hyperliquid Alert Bot Online</b>\n"
             f"Scanning all active markets every {SCAN_INTERVAL_MINUTES}min\n"
             f"Filters: Daily & 4H 200 EMA bias + SFP (4H & Daily)\n"
             f"Started at {bst_now()}"
