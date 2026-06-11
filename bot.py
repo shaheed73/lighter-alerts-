@@ -37,10 +37,40 @@ MIN_WICK_PCT = 0.0075  # 0.75%
 MIN_RR = 2.0
 
 # Maximum % price can be beyond entry zone before alert is suppressed
-MAX_ENTRY_DRIFT_PCT = 0.02  # 2.0%
+MAX_ENTRY_DRIFT_PCT = 0.03  # 3.0%
+
+# Drift level above which the alert carries a warning flag
+DRIFT_WARN_PCT = 0.01  # 1%
 
 # Deduplication: tracks already-alerted SFPs {symbol_timeframe: candle_timestamp}
+# Persisted to disk so Railway restarts don't cause repeat alerts.
+DEDUP_FILE = "alerted_sfps.json"
 alerted_sfps: dict = {}
+
+
+def load_dedup() -> None:
+    """Load the dedup dict from disk on startup."""
+    global alerted_sfps
+    try:
+        import json
+        with open(DEDUP_FILE, "r") as f:
+            alerted_sfps = json.load(f)
+        log.info(f"Loaded {len(alerted_sfps)} dedup entries from disk")
+    except FileNotFoundError:
+        alerted_sfps = {}
+    except Exception as e:
+        log.warning(f"Could not load dedup file: {e}")
+        alerted_sfps = {}
+
+
+def save_dedup() -> None:
+    """Persist the dedup dict to disk after each new alert."""
+    try:
+        import json
+        with open(DEDUP_FILE, "w") as f:
+            json.dump(alerted_sfps, f)
+    except Exception as e:
+        log.warning(f"Could not save dedup file: {e}")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -146,38 +176,90 @@ def calculate_ema(prices: list[float], period: int) -> float | None:
     return ema
 
 
-def find_nearest_target(candles: list[dict], direction: str, entry: float, stop: float) -> float | None:
+def find_targets(candles: list[dict], direction: str, entry: float, stop: float) -> tuple[float | None, float | None]:
     """
-    Find the nearest genuine resistance (for longs) or support (for shorts)
-    by scanning TARGET_LOOKBACK candles for swing highs/lows.
-    Only returns levels that give at least MIN_RR.
+    Find up to two targets by scanning TARGET_LOOKBACK candles for swing highs/lows.
+    TP1 = nearest genuine level giving at least MIN_RR.
+    TP2 = next genuine level beyond TP1 (for the runner portion).
     """
     risk = abs(entry - stop)
     if risk == 0:
-        return None
+        return None, None
 
     min_target_distance = risk * MIN_RR
     scan_candles = candles[-(TARGET_LOOKBACK + 2):-2]
     if not scan_candles:
-        return None
+        return None, None
 
+    candidates = []
     if direction == "long":
-        candidates = []
         for i in range(1, len(scan_candles) - 1):
             c = scan_candles[i]
             if c["h"] > scan_candles[i - 1]["h"] and c["h"] > scan_candles[i + 1]["h"]:
                 if c["h"] >= entry + min_target_distance:
                     candidates.append(c["h"])
-        return min(candidates) if candidates else None
+        if not candidates:
+            return None, None
+        tp1 = min(candidates)
+        beyond = [v for v in candidates if v > tp1]
+        tp2 = min(beyond) if beyond else None
+        return tp1, tp2
 
     else:
-        candidates = []
         for i in range(1, len(scan_candles) - 1):
             c = scan_candles[i]
             if c["l"] < scan_candles[i - 1]["l"] and c["l"] < scan_candles[i + 1]["l"]:
                 if c["l"] <= entry - min_target_distance:
                     candidates.append(c["l"])
-        return max(candidates) if candidates else None
+        if not candidates:
+            return None, None
+        tp1 = max(candidates)
+        beyond = [v for v in candidates if v < tp1]
+        tp2 = max(beyond) if beyond else None
+        return tp1, tp2
+
+
+def find_order_blocks(candles: list[dict], direction: str) -> list[tuple[float, float]]:
+    """
+    Detect order block zones over TARGET_LOOKBACK candles.
+    Bullish OB (for longs): last bearish candle before an impulsive up move.
+    Bearish OB (for shorts): last bullish candle before an impulsive down move.
+    Impulse = within the next 3 candles, price closes beyond the OB candle's
+    range AND the total move is at least 2x the OB candle's range and 2% of price.
+    Returns list of (zone_low, zone_high) tuples.
+    """
+    zones = []
+    scan = candles[-(TARGET_LOOKBACK + 2):-2]
+    for i in range(len(scan) - 3):
+        c = scan[i]
+        rng = c["h"] - c["l"]
+        if rng <= 0:
+            continue
+        window = scan[i + 1:i + 4]
+
+        if direction == "long" and c["c"] < c["o"]:
+            # Bearish candle, then impulsive move up through its high
+            if any(w["c"] > c["h"] for w in window):
+                move = max(w["h"] for w in window) - c["l"]
+                if move >= 2 * rng and move / c["l"] >= 0.02:
+                    zones.append((c["l"], c["h"]))
+
+        elif direction == "short" and c["c"] > c["o"]:
+            # Bullish candle, then impulsive move down through its low
+            if any(w["c"] < c["l"] for w in window):
+                move = c["h"] - min(w["l"] for w in window)
+                if move >= 2 * rng and move / c["h"] >= 0.02:
+                    zones.append((c["l"], c["h"]))
+
+    return zones
+
+
+def check_ob_confluence(zones: list[tuple[float, float]], direction: str, wick_extreme: float) -> tuple[float, float] | None:
+    """Return the OB zone the SFP wick swept into, if any."""
+    for zlow, zhigh in zones:
+        if zlow <= wick_extreme <= zhigh:
+            return (zlow, zhigh)
+    return None
 
 
 def detect_sfp(candles: list[dict]) -> dict | None:
@@ -265,6 +347,31 @@ def bst_now() -> str:
     return f"{bst.strftime('%Y-%m-%d %H:%M')} BST ({utc_now.strftime('%H:%M')} UTC)"
 
 
+def fmt_price(value: float, ref_price: float) -> str:
+    """Format a price with decimal places scaled to the asset's magnitude.
+
+    Uses the asset's current price (ref_price) to pick precision so that
+    entry/stop/target on the same alert all share the same decimal count
+    and small differences remain visible on very low-priced assets.
+    """
+    ref = abs(ref_price)
+    if ref >= 1000:
+        decimals = 1
+    elif ref >= 100:
+        decimals = 2
+    elif ref >= 1:
+        decimals = 4
+    elif ref >= 0.01:
+        decimals = 5
+    elif ref >= 0.001:
+        decimals = 6
+    elif ref >= 0.0001:
+        decimals = 7
+    else:
+        decimals = 8
+    return f"{value:.{decimals}f}"
+
+
 def format_alert(
     symbol: str,
     market_type: str,
@@ -275,6 +382,9 @@ def format_alert(
     current_price: float,
     target: float,
     rr: float,
+    drift: float,
+    tp2: float | None,
+    ob_zone: tuple[float, float] | None,
 ) -> str:
     direction = sfp["direction"].upper()
     emoji = "🟢" if sfp["direction"] == "long" else "🔴"
@@ -282,23 +392,44 @@ def format_alert(
     wick_pct = sfp.get("wick_pct", 0) * 100
     entry = sfp["swing_level"]
     stop = sfp["wick_extreme"]
+    fp = lambda v: fmt_price(v, current_price)
+
+    risk = abs(entry - stop)
+    tp2_line = ""
+    if tp2 is not None and risk > 0:
+        rr2 = abs(tp2 - entry) / risk
+        tp2_line = f"🏁 <b>TP2 (runner):</b> {fp(tp2)} ({rr2:.1f}:1)\n"
+
+    ob_line = ""
+    if ob_zone is not None:
+        ob_line = (
+            f"🧱 <b>OB Confluence:</b> wick swept into order block "
+            f"({fp(ob_zone[0])}–{fp(ob_zone[1])})\n"
+        )
+
+    drift_line = ""
+    if drift > DRIFT_WARN_PCT:
+        drift_line = f"⚠️ <b>Entry drifting ({drift*100:.1f}%) — act fast or skip</b>\n"
 
     return (
         f"{emoji} <b>SFP SETUP — {symbol} ({market_type.upper()})</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>Timeframe:</b> {timeframe}\n"
         f"📍 <b>Direction:</b> {direction}\n"
-        f"💰 <b>Current Price:</b> {current_price:.4f}\n"
-        f"📏 <b>Swing Level:</b> {entry:.4f}\n"
-        f"🔽 <b>Wick Extreme:</b> {stop:.4f} ({wick_pct:.2f}% breach)\n"
+        f"💰 <b>Current Price:</b> {fp(current_price)}\n"
+        f"📏 <b>Swing Level:</b> {fp(entry)}\n"
+        f"🔽 <b>Wick Extreme:</b> {fp(stop)} ({wick_pct:.2f}% breach)\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 <b>Entry Zone:</b> {entry:.4f}\n"
-        f"🛑 <b>Stop:</b> {stop:.4f}\n"
-        f"🏁 <b>Target:</b> {target:.4f}\n"
+        f"🎯 <b>Entry Zone:</b> {fp(entry)}\n"
+        f"🛑 <b>Stop:</b> {fp(stop)}\n"
+        f"🏁 <b>TP1 (75%):</b> {fp(target)}\n"
         f"📐 <b>R:R:</b> {rr:.1f}:1\n"
+        f"{tp2_line}"
+        f"{ob_line}"
+        f"{drift_line}"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📈 <b>Daily 200 EMA:</b> {ema_daily:.4f}\n"
-        f"📈 <b>4H 200 EMA:</b> {ema_4h:.4f}\n"
+        f"📈 <b>Daily 200 EMA:</b> {fp(ema_daily)}\n"
+        f"📈 <b>4H 200 EMA:</b> {fp(ema_4h)}\n"
         f"✅ <b>Bias:</b> Price {bias} both EMAs → {direction} bias confirmed\n"
         f"🕒 <b>Scan time:</b> {bst_now()}"
     )
@@ -369,13 +500,16 @@ async def scan_market(
                         log.debug(f"{symbol} Daily SFP drift {drift*100:.1f}% too large, suppressing")
                     else:
                         risk = abs(entry - stop)
-                        target = find_nearest_target(daily_candles, daily_sfp["direction"], entry, stop)
+                        target, tp2 = find_targets(daily_candles, daily_sfp["direction"], entry, stop)
                         if target is None:
                             log.debug(f"{symbol} Daily SFP no valid 2:1 target, skipping")
                         else:
+                            ob_zones = find_order_blocks(daily_candles, daily_sfp["direction"])
+                            ob_zone = check_ob_confluence(ob_zones, daily_sfp["direction"], stop)
                             rr = abs(target - entry) / risk
                             alerted_sfps[dedup_key] = candle_ts
-                            msg = format_alert(symbol, market_type, "Daily", daily_sfp, ema_200_daily, ema_200_4h, current_price, target, rr)
+                            save_dedup()
+                            msg = format_alert(symbol, market_type, "Daily", daily_sfp, ema_200_daily, ema_200_4h, current_price, target, rr, drift, tp2, ob_zone)
                             alerts.append(msg)
                             log.info(f"ALERT: {symbol} Daily SFP {daily_sfp['direction'].upper()} R:R={rr:.1f}")
                 else:
@@ -404,13 +538,16 @@ async def scan_market(
                             log.debug(f"{symbol} 4H SFP drift {drift*100:.1f}% too large, suppressing")
                         else:
                             risk = abs(entry - stop)
-                            target = find_nearest_target(h4_candles, h4_sfp["direction"], entry, stop)
+                            target, tp2 = find_targets(h4_candles, h4_sfp["direction"], entry, stop)
                             if target is None:
                                 log.debug(f"{symbol} 4H SFP no valid 2:1 target, skipping")
                             else:
+                                ob_zones = find_order_blocks(h4_candles, h4_sfp["direction"])
+                                ob_zone = check_ob_confluence(ob_zones, h4_sfp["direction"], stop)
                                 rr = abs(target - entry) / risk
                                 alerted_sfps[dedup_key] = candle_ts
-                                msg = format_alert(symbol, market_type, "4H", h4_sfp, ema_200_daily, ema_200_4h, current_price, target, rr)
+                                save_dedup()
+                                msg = format_alert(symbol, market_type, "4H", h4_sfp, ema_200_daily, ema_200_4h, current_price, target, rr, drift, tp2, ob_zone)
                                 alerts.append(msg)
                                 log.info(f"ALERT: {symbol} 4H SFP {h4_sfp['direction'].upper()} R:R={rr:.1f}")
                     else:
@@ -463,6 +600,8 @@ async def main() -> None:
     if TELEGRAM_TOKEN == "YOUR_BOT_TOKEN_HERE" or TELEGRAM_CHAT_ID == "YOUR_CHAT_ID_HERE":
         log.error("Set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID environment variables before running.")
         return
+
+    load_dedup()
 
     async with aiohttp.ClientSession() as session:
         await send_telegram(
