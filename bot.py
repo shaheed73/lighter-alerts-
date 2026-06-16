@@ -37,7 +37,7 @@ MIN_WICK_PCT = 0.0075  # 0.75%
 MIN_RR = 2.0
 
 # Maximum % price can be beyond entry zone before alert is suppressed
-MAX_ENTRY_DRIFT_PCT = 0.03  # 3.0%
+MAX_ENTRY_DRIFT_PCT = 0.02  # 2.0%
 
 # Drift level above which the alert carries a warning flag
 DRIFT_WARN_PCT = 0.01  # 1%
